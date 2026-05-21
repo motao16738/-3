@@ -1,0 +1,46 @@
+import streamlit as st
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+# 1. 介面設定
+st.title("媒體曝光自動化抓蟲系統")
+keyword = st.text_input("請輸入新聞關鍵字:")
+
+# 2. 上傳媒體列表
+uploaded_file = st.file_uploader("請上傳媒體列表 CSV:", type="csv")
+
+def crawl_site(keyword, url):
+    """針對特定媒體網站進行搜尋的爬蟲模組"""
+    try:
+        # 這裡以通用的搜尋路徑為例，實際應用需根據該媒體的搜尋結構調整
+        search_url = f"https://www.google.com/search?q={keyword}+site:{url}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(search_url, headers=headers)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # 簡易的連結擷取邏輯
+        links = [a['href'] for a in soup.select('a[href^="http"]') if url in a['href']]
+        return links[:3] # 回傳前3筆結果
+    except:
+        return []
+
+# 3. 執行抓蟲動作
+if st.button("開始抓蟲") and uploaded_file:
+    media_df = pd.read_csv(uploaded_file)
+    results = []
+    
+    with st.spinner('正在深度抓取中，請稍候...'):
+        for index, row in media_df.iterrows():
+            media_name = row['媒體名稱']
+            media_url = row['網址']
+            
+            if pd.notna(media_url):
+                found_links = crawl_site(keyword, media_url)
+                for link in found_links:
+                    results.append({'媒體': media_name, '連結': link})
+    
+    # 4. 輸出結果
+    results_df = pd.DataFrame(results)
+    st.write("抓取結果:")
+    st.dataframe(results_df)
+    st.download_button("下載報表", results_df.to_csv(index=False), "抓蟲報告.csv")
