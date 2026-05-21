@@ -2,45 +2,350 @@ import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import time
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+import logging
 
-# 1. 介面設定
-st.title("媒體曝光自動化抓蟲系統")
-keyword = st.text_input("請輸入新聞關鍵字:")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 2. 上傳媒體列表
-uploaded_file = st.file_uploader("請上傳媒體列表 CSV:", type="csv")
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
 
-def crawl_site(keyword, url):
-    """針對特定媒體網站進行搜尋的爬蟲模組"""
-    try:
-        # 這裡以通用的搜尋路徑為例，實際應用需根據該媒體的搜尋結構調整
-        search_url = f"https://www.google.com/search?q={keyword}+site:{url}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(search_url, headers=headers)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        # 簡易的連結擷取邏輯
-        links = [a['href'] for a in soup.select('a[href^="http"]') if url in a['href']]
-        return links[:3] # 回傳前3筆結果
-    except:
+@dataclass
+class CrawlerConfig:
+    """Configuration for web crawler behavior"""
+    timeout: int = 10
+    max_results: int = 5
+    rate_limit_delay: float = 1.0  # seconds between requests
+    max_retries: int = 2
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# ============================================================================
+# MEDIA CRAWLER MODULE
+# ============================================================================
+
+class MediaCrawler:
+    """Handles web crawling for specific media sites with error handling and rate limiting"""
+    
+    def __init__(self, config: CrawlerConfig = None):
+        self.config = config or CrawlerConfig()
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': self.config.user_agent})
+        self.last_request_time = 0
+    
+    def _rate_limit(self) -> None:
+        """Enforce rate limiting between requests"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.config.rate_limit_delay:
+            time.sleep(self.config.rate_limit_delay - elapsed)
+        self.last_request_time = time.time()
+    
+    def _is_valid_url(self, url: str, base_domain: str) -> bool:
+        """Validate that URL belongs to the target domain"""
+        try:
+            parsed_url = urlparse(url)
+            parsed_domain = urlparse(base_domain)
+            return parsed_domain.netloc in parsed_url.netloc
+        except Exception:
+            return False
+    
+    def crawl_site(self, keyword: str, media_url: str) -> List[str]:
+        """
+        Crawl a specific media site for keyword mentions.
+        
+        Args:
+            keyword: Search keyword
+            media_url: Base URL of media site
+            
+        Returns:
+            List of found URLs (up to max_results)
+        """
+        if not keyword or not media_url:
+            logger.warning(f"Invalid inputs: keyword={keyword}, url={media_url}")
+            return []
+        
+        # Clean up URL
+        if not media_url.startswith(('http://', 'https://')):
+            media_url = f"https://{media_url}"
+        
+        for attempt in range(self.config.max_retries):
+            try:
+                self._rate_limit()
+                
+                # Use site-specific search if available, otherwise fall back to general search
+                search_url = self._build_search_url(keyword, media_url)
+                logger.info(f"Attempting to crawl: {search_url}")
+                
+                response = self.session.get(
+                    search_url,
+                    timeout=self.config.timeout,
+                    allow_redirects=True
+                )
+                response.raise_for_status()
+                
+                links = self._extract_links(response.text, media_url)
+                logger.info(f"Found {len(links)} links from {media_url}")
+                return links[:self.config.max_results]
+                
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout on attempt {attempt + 1}/{self.config.max_retries}: {media_url}")
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(2 ** attempt)  # exponential backoff
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"Connection error: {e}")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error crawling {media_url}: {e}")
+                break
+        
         return []
+    
+    def _build_search_url(self, keyword: str, media_url: str) -> str:
+        """Build appropriate search URL based on media site structure"""
+        domain = urlparse(media_url).netloc
+        # Try common search patterns
+        search_paths = [
+            f"{media_url}/search?q={keyword}",
+            f"{media_url}/search?keyword={keyword}",
+            f"https://www.google.com/search?q={keyword}+site:{domain}",
+        ]
+        return search_paths[0]  # Start with site-specific search
+    
+    def _extract_links(self, html: str, base_url: str) -> List[str]:
+        """Extract and validate links from HTML"""
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            links = set()
+            
+            for anchor in soup.find_all('a', href=True):
+                href = anchor['href']
+                try:
+                    # Convert relative URLs to absolute
+                    absolute_url = urljoin(base_url, href)
+                    
+                    # Only keep links from the target domain
+                    if self._is_valid_url(absolute_url, base_url):
+                        links.add(absolute_url)
+                except Exception as e:
+                    logger.debug(f"Skipping invalid URL: {href} - {e}")
+            
+            return list(links)
+        except Exception as e:
+            logger.error(f"Error parsing HTML: {e}")
+            return []
 
-# 3. 執行抓蟲動作
-if st.button("開始抓蟲") and uploaded_file:
-    media_df = pd.read_csv(uploaded_file)
+# ============================================================================
+# STREAMLIT INTERFACE
+# ============================================================================
+
+def init_session_state():
+    """Initialize Streamlit session state"""
+    if 'crawler_config' not in st.session_state:
+        st.session_state.crawler_config = CrawlerConfig()
+    if 'results' not in st.session_state:
+        st.session_state.results = None
+
+def render_sidebar():
+    """Render configuration sidebar"""
+    with st.sidebar:
+        st.header("⚙️ 配置設定")
+        
+        timeout = st.slider(
+            "請求超時時間 (秒)",
+            min_value=5,
+            max_value=30,
+            value=st.session_state.crawler_config.timeout,
+            step=1
+        )
+        
+        max_results = st.slider(
+            "每個媒體最多結果數",
+            min_value=1,
+            max_value=20,
+            value=st.session_state.crawler_config.max_results,
+            step=1
+        )
+        
+        rate_limit = st.slider(
+            "請求延遲 (秒)",
+            min_value=0.5,
+            max_value=5.0,
+            value=st.session_state.crawler_config.rate_limit_delay,
+            step=0.5
+        )
+        
+        # Update config
+        st.session_state.crawler_config.timeout = timeout
+        st.session_state.crawler_config.max_results = max_results
+        st.session_state.crawler_config.rate_limit_delay = rate_limit
+
+def main():
+    """Main application entry point"""
+    st.set_page_config(
+        page_title="媒體曝光自動化爬蟲系統",
+        page_icon="🔍",
+        layout="wide"
+    )
+    
+    init_session_state()
+    
+    # Header
+    st.title("🔍 媒體曝光自動化爬蟲系統")
+    st.markdown("---")
+    
+    # Sidebar configuration
+    render_sidebar()
+    
+    # Main content
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        keyword = st.text_input(
+            "請輸入新聞關鍵字:",
+            placeholder="例如：氣候變遷、新產品發布"
+        )
+    
+    with col2:
+        st.empty()  # Spacer
+    
+    # File uploader
+    uploaded_file = st.file_uploader(
+        "請上傳媒體列表 CSV (需要欄位: 媒體名稱, 網址):",
+        type="csv",
+        help="CSV 應包含 '媒體名稱' 和 '網址' 兩列"
+    )
+    
+    # Validation
+    if uploaded_file:
+        try:
+            media_df = pd.read_csv(uploaded_file)
+            required_cols = {'媒體名稱', '網址'}
+            missing_cols = required_cols - set(media_df.columns)
+            
+            if missing_cols:
+                st.error(f"❌ CSV 缺少必要欄位: {', '.join(missing_cols)}")
+                st.stop()
+            
+            st.info(f"✅ 已載入 {len(media_df)} 個媒體")
+        except Exception as e:
+            st.error(f"❌ 無法讀取 CSV: {str(e)}")
+            st.stop()
+    else:
+        media_df = None
+    
+    # Crawl button
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        should_crawl = st.button("🚀 開始爬蟲", use_container_width=True)
+    
+    # Execute crawling
+    if should_crawl:
+        if not keyword:
+            st.error("❌ 請輸入關鍵字")
+            st.stop()
+        
+        if media_df is None:
+            st.error("❌ 請上傳媒體列表")
+            st.stop()
+        
+        results = crawl_media_list(keyword, media_df)
+        st.session_state.results = results
+    
+    # Display results
+    if st.session_state.results is not None:
+        display_results(st.session_state.results)
+
+def crawl_media_list(keyword: str, media_df: pd.DataFrame) -> pd.DataFrame:
+    """Execute crawling for all media in the list"""
+    crawler = MediaCrawler(st.session_state.crawler_config)
     results = []
     
-    with st.spinner('正在深度抓取中，請稍候...'):
-        for index, row in media_df.iterrows():
-            media_name = row['媒體名稱']
-            media_url = row['網址']
-            
-            if pd.notna(media_url):
-                found_links = crawl_site(keyword, media_url)
-                for link in found_links:
-                    results.append({'媒體': media_name, '連結': link})
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    # 4. 輸出結果
-    results_df = pd.DataFrame(results)
-    st.write("抓取結果:")
-    st.dataframe(results_df)
-    st.download_button("下載報表", results_df.to_csv(index=False), "抓蟲報告.csv")
+    total_media = len(media_df)
+    
+    for index, row in media_df.iterrows():
+        media_name = row['媒體名稱']
+        media_url = row['網址']
+        
+        # Update progress
+        progress = (index + 1) / total_media
+        progress_bar.progress(progress)
+        status_text.text(f"正在爬蟲: {media_name} ({index + 1}/{total_media})")
+        
+        if pd.isna(media_url) or not media_url.strip():
+            logger.warning(f"Skipping {media_name}: empty URL")
+            continue
+        
+        try:
+            found_links = crawler.crawl_site(keyword, str(media_url).strip())
+            
+            for link in found_links:
+                results.append({
+                    '媒體名稱': media_name,
+                    '連結': link,
+                    '發現時間': pd.Timestamp.now()
+                })
+        except Exception as e:
+            logger.error(f"Error crawling {media_name}: {e}")
+            results.append({
+                '媒體名稱': media_name,
+                '連結': f"[錯誤: {str(e)}]",
+                '發現時間': pd.Timestamp.now()
+            })
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return pd.DataFrame(results) if results else pd.DataFrame(columns=['媒體名稱', '連結', '發現時間'])
+
+def display_results(results_df: pd.DataFrame) -> None:
+    """Display crawling results with export options"""
+    st.markdown("---")
+    st.subheader("📊 爬蟲結果")
+    
+    if results_df.empty:
+        st.warning("⚠️ 未發現任何結果")
+        return
+    
+    # Display statistics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("找到的連結", len(results_df))
+    with col2:
+        st.metric("媒體數量", results_df['媒體名稱'].nunique())
+    with col3:
+        error_count = results_df['連結'].str.startswith('[錯誤').sum()
+        st.metric("錯誤數", error_count)
+    
+    st.markdown("---")
+    
+    # Display dataframe
+    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    
+    # Export options
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        csv_data = results_df.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="📥 下載 CSV 報表",
+            data=csv_data,
+            file_name=f"爬蟲報告_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+    
+    with col2:
+        excel_data = results_df.to_excel(
+            index=False,
+            sheet_name="爬蟲結果"
+        ) if st.checkbox("匯出為 Excel?") else None
+
+if __name__ == "__main__":
+    main()
